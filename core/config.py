@@ -244,7 +244,7 @@ class Config:
     # CONVERSATION
     # =========================================================================
     CONVERSATION_WINDOW_SIZE = int(os.getenv("CONVERSATION_WINDOW_SIZE", "3"))
-    MAX_RECORDING_DURATION = float(os.getenv("MAX_RECORDING_DURATION", "25"))
+    MAX_RECORDING_DURATION = float(os.getenv("MAX_RECORDING_DURATION", "60"))
     SILENCE_THRESHOLD = int(os.getenv("SILENCE_THRESHOLD", "400"))
 
     # =========================================================================
