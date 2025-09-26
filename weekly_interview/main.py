@@ -139,12 +139,11 @@ class UltraFastInterviewManager:
             logger.info("Session %s: received %d bytes of audio", session_id, audio_size)
             if audio_size < 100:
                 raise Exception(f"Audio too small: {audio_size} bytes (minimum 100 bytes required)")
-
+    
             transcript, quality = await self.audio_processor.transcribe_audio_fast(audio_data)
+            logger.info("Session %s: transcript='%s' quality=%.2f bytes=%d",session_id, (transcript or "").strip(), quality, audio_size)
             if not transcript or len(transcript.strip()) < 2:
                 raise Exception(f"Transcription failed or too short: '{transcript}' (quality: {quality})")
-
-            logger.info("Session %s: transcript='%s' quality=%.2f", session_id, transcript, quality)
 
             if session_data.exchanges:
                 session_data.update_last_response(transcript, quality)
@@ -528,7 +527,61 @@ async def websocket_endpoint_ultra_fast(websocket: WebSocket, session_id: str):
     finally:
         await interview_manager.remove_session(session_id)
         logger.info("Session %s cleaned up", session_id)
-
+    
+@app.get("/health")
+async def health_check_fast():
+    """Ultra-fast health check with real database status and TTS status"""
+    try:
+        db_status = {"mysql": False, "mongodb": False}
+        tts_status = {"status": "unknown"}
+        
+        # Quick database health check
+        try:
+            db_manager = DatabaseManager(shared_clients)
+            
+            # Test MySQL
+            conn = db_manager.get_mysql_connection()
+            conn.close()
+            db_status["mysql"] = True
+            
+            # Test MongoDB
+            await db_manager.get_mongo_client()
+            db_status["mongodb"] = True
+            
+        except Exception as e:
+            logger.warning(f"?? Database health check failed: {e}")
+        
+        # Quick TTS health check
+        try:
+            tts_status = await interview_manager.tts_processor.health_check()
+        except Exception as e:
+            logger.warning(f"?? TTS health check failed: {e}")
+            tts_status = {"status": "error", "error": str(e)}
+        
+        overall_status = "healthy" if (all(db_status.values()) and tts_status.get("status") != "error") else "degraded"
+        
+        return {
+            "status": overall_status,
+            "service": "ultra_fast_interview_system",
+            "timestamp": time.time(),
+            "active_sessions": len(interview_manager.active_sessions),
+            "version": config.APP_VERSION,
+            "database_status": db_status,
+            "tts_status": tts_status,
+            "features": {
+                "7_day_summaries": True,
+                "fragment_based_questions": True,
+                "real_time_streaming": True,
+                "ultra_fast_tts": True,
+                "round_based_interview": True,
+                "modular_tts": True,
+                "fail_loud_debugging": True
+            }
+        }
+    except Exception as e:
+        logger.error(f"? Health check failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
+        
 @app.websocket("/weekly_interview/ws/{session_id}")
 async def websocket_endpoint_weekly_interview(websocket: WebSocket, session_id: str):
     logger.info("Routing weekly_interview WebSocket to main endpoint: %s", session_id)

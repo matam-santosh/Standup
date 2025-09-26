@@ -380,6 +380,7 @@ Max 20 words. Be original every time."""
         Respond with just ONE line like above, keeping it warm and professional.
         """
         return _append_boundaries(core)
+    
     @staticmethod
     def boundary_vulgar_prompt(topic: str) -> str:
         core = f"User used inappropriate language. Give ONE short warning and restate the topic: {topic}. Do not repeat the language."

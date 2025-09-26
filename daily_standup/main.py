@@ -665,7 +665,7 @@ class UltraFastSessionManagerWithSilenceHandling:
             audio_bytes = base64.b64decode(audio_b64)
             logger.info("Session %s: processing normal audio (%d bytes)", session_id, len(audio_bytes))
             transcript, quality = await self.audio_processor.transcribe_audio_fast(audio_bytes)
-
+            logger.info("🗣️ User transcript: %s  (quality=%.2f, bytes=%d)",(transcript or "").strip(), quality, len(audio_bytes))
             # Reset silence counter and mark spoken on any real transcript
             if transcript and transcript.strip():
                 session_data.consecutive_silence_chunks = 0
@@ -1349,8 +1349,6 @@ async def health_check_fast():
 # =============================================================================
 # ENHANCED WEBSOCKET WITH SILENCE HANDLING
 # =============================================================================
-
-@app.websocket("/ws/{session_id}")
 @app.websocket("/ws/{session_id}")
 async def enhanced_websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
