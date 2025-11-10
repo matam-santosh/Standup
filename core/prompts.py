@@ -355,32 +355,27 @@ Max 20 words. Be original every time."""
         name = session_context.get("name", "")
         time_of_day = session_context.get("time_of_day", "")
 
-
         core = f"""The user has been silent for a while in this standup session.
 
+    You are the AI standup assistant.
+    Be gentle and encouraging.
 
-        You are the AI standup assistant.
-        Be gentle and encouraging.
+    - Ask if they are comfortable or okay to continue.
+    - Use very simple and polite language.
+    - Mention you’re ready when they are.
+    - If context available, mention domain or topic briefly.
+    - Keep it short and friendly (max 18 words).
 
+    EXAMPLES:
+    - "Are you feeling okay to continue? We can start whenever you're ready."
+    - "If you're comfortable, let's begin with your {domain} update. Just let me know."
+    - "No rush! When you're ready, we can start with {domain}."
+    - "Just checking in—shall we go ahead with {domain}?"
 
-        - Ask if they are comfortable or okay to continue.
-        - Use very simple and polite language.
-        - Mention you’re ready when they are.
-        - If context available, mention domain or topic briefly.
-        - Keep it short and friendly (max 18 words).
-
-
-        EXAMPLES:
-        - "Are you feeling okay to continue? We can start whenever you're ready."
-        - "If you're comfortable, let's begin with your {domain} update. Just let me know."
-        - "No rush! When you're ready, we can start with {domain}."
-        - "Just checking in—shall we go ahead with {domain}?"
-
-
-        Respond with just ONE line like above, keeping it warm and professional.
-        """
+    Respond with just ONE line like above, keeping it warm and professional."""
         return _append_boundaries(core)
-    
+
+        
     @staticmethod
     def boundary_vulgar_prompt(topic: str) -> str:
         core = f"User used inappropriate language. Give ONE short warning and restate the topic: {topic}. Do not repeat the language."

@@ -16,6 +16,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from datetime import datetime
 import base64
+import random
 
 # Local imports - use package-relative, keep names intact
 from core import *
@@ -26,6 +27,7 @@ from core.ai_services import ds_shared_clients as shared_clients
 from core.config import config
 from core.database import DatabaseManager
 from core.ai_services import DS_OptimizedAudioProcessor as OptimizedAudioProcessor
+
 # ⬇ Unified Chatterbox TTS
 from core.tts_processor import UnifiedTTSProcessor as UltraFastTTSProcessor
 from core.ai_services import DS_OptimizedConversationManager as OptimizedConversationManager
@@ -74,7 +76,7 @@ class UltraFastSessionManagerWithSilenceHandling:
                 "name": session_data.student_name,
                 "silence_count": session_data.silence_response_count,
                 "current_stage": session_data.current_stage.value,
-                "conversation_length": len(getattr(session_data,"conversation_log", [])),
+                "conversation_length": len(getattr(session_data, "conversation_log", [])),
                 "time_elapsed": time.time() - session_data.created_at,
                 "domain": getattr(session_data, "current_domain", "your work"),
                 "last_topic": getattr(session_data, "current_concept", None),
@@ -93,20 +95,44 @@ class UltraFastSessionManagerWithSilenceHandling:
             )
             
             response_text = (response_text or "").strip()
+            # 🩵 Force concise silence line if LLM writes a long paragraph
+            if len(response_text.split()) > 25:
+                logger.warning("🩵 Long silence message detected — replacing with concise version")
+                response_text = f"Are you facing challenges with this topic, {session_data.student_name}? Take your time; we can continue whenever you’re ready."
+
+
+            # 🧹 Sanitize any instruction-style echo (prevents template dump)
+            if any(marker.lower() in response_text.lower() for marker in [
+                "you are the ai standup assistant",
+                "examples:",
+                "boundaries:",
+                "generate a response",
+                "be gentle and encouraging",
+            ]):
+                logger.warning("⚠️ Detected instruction text from LLM — replacing with fallback")
+                response_text = f"Are you feeling okay to continue, {session_data.student_name}? We can start whenever you’re ready."
             
-            # Fallback responses if LLM fails
+            # Fallback responses if LLM fails or short text
             if not response_text or len(response_text.split()) < 3:
                 fallback_responses = [
-                    f"Take your time, {session_data.student_name}. I'm here when you're ready to continue.",
-                    f"No worries, {session_data.student_name}. Feel free to share your thoughts when you're comfortable.",
-                    f"I understand you might need a moment to think. Let's continue whenever you're ready.",
-                    f"That's okay, {session_data.student_name}. Would you like me to ask about something different?"
+                    f"Are you facing challenges with this current topic, {session_data.student_name}? Should we skip to another one?",
+                    f"No worries if you're stuck — that happens to everyone, {session_data.student_name}. Let's move to the next question.",
+                    f"It's okay to pause for a bit, {session_data.student_name}. Would you like me to rephrase the question?",
+                    f"Seems like this part might be tricky, {session_data.student_name}. Want me to give a hint or move on?",
+                    f"No problem at all, {session_data.student_name}. Let's continue when you're ready or we can switch topics.",
+                    f"Take a moment to think, {session_data.student_name}. It's perfectly fine — shall I simplify this question?",
+                    f"I understand this might be challenging, {session_data.student_name}. Would you like to try a different one?",
+                    f"Don’t worry, {session_data.student_name}. These things take time — let’s continue when you’re ready."
                 ]
-                response_text = fallback_responses[min(silence_count, len(fallback_responses) - 1)]
-            
+                
+                # 🎯 Hybrid logic: progressive tone + random variation
+                stage_index = min(silence_count, len(fallback_responses) - 1)
+                start_idx = max(0, stage_index - 2)
+                response_text = random.choice(fallback_responses[start_idx:stage_index + 1])
+
             logger.info("Generated silence response #%d: %s", session_data.silence_response_count, response_text[:50])
             return response_text
-            
+
         except Exception as e:
             logger.error("Silence response generation error: %s", e)
             return f"I understand, {session_data.student_name}. Take your time, and let's continue when you're ready."
@@ -540,8 +566,9 @@ class UltraFastSessionManagerWithSilenceHandling:
             logger.info("Removed session %s", session_id)
 
     # Enhanced audio processing with silence detection
+    # Enhanced audio processing with silence detection (audible silence prompts)
     async def process_audio_with_silence_status(self, session_id: str, message_data: dict):
-        """Process audio data with refined silence gating & consecutive counter."""
+        """Process audio data with refined silence gating & consecutive counter (overlap-safe, audible prompts)."""
         session_data = self.active_sessions.get(session_id)
         if not session_data or not session_data.is_active:
             logger.warning("Inactive session: %s", session_id)
@@ -550,13 +577,25 @@ class UltraFastSessionManagerWithSilenceHandling:
         start_time = time.time()
 
         try:
-            # Extract status info
+            # Extract incoming info
             user_status = message_data.get('userStatus', 'unknown')
             silence_detected_flag = bool(message_data.get('silenceDetected', False))
             recording_duration = int(message_data.get('recordingDuration', 0))
             audio_b64 = message_data.get('audio', '') or ''
 
-            # Time limits
+            # 🧩 Prevent overlapping — skip if AI is currently speaking
+            if getattr(session_data, "tts_active", False):
+                logger.info("🔒 Ignoring user input — AI still speaking (tts_active=True)")
+                return
+
+            if getattr(session_data, "awaiting_user", False) and not audio_b64:
+                logger.info("⏸️ Ignoring silence ping — still waiting for real user speech")
+                return
+            elif getattr(session_data, "awaiting_user", False) and audio_b64:
+                logger.info("🎙️ Received real speech while awaiting_user=True — resuming normal flow")
+                session_data.awaiting_user = False
+
+            # --- Session end handling ---
             now_ts = time.time()
             end_time = getattr(session_data, "end_time", None)
             if end_time and now_ts >= end_time:
@@ -565,8 +604,10 @@ class UltraFastSessionManagerWithSilenceHandling:
                         if audio_b64:
                             audio_bytes = base64.b64decode(audio_b64)
                             transcript, quality = await self.audio_processor.transcribe_audio_fast(audio_bytes)
-                            logger.info("🗣️ User transcript: %s  (quality=%.2f, bytes=%d)",
-                            (transcript or "").strip(), quality, len(audio_bytes))
+                            logger.info(
+                                "🗣️ User transcript: %s  (quality=%.2f, bytes=%d)",
+                                (transcript or "").strip(), quality, len(audio_bytes)
+                            )
                             if transcript.strip():
                                 concept = session_data.current_concept or "unknown"
                                 is_followup = getattr(session_data, "_last_question_followup", False)
@@ -584,10 +625,6 @@ class UltraFastSessionManagerWithSilenceHandling:
                 (now_ts - session_data.greeting_end_ts) >= session_data.silence_grace_after_greeting_s
             )
             has_audio_payload = bool(audio_b64)
-            # We only treat a chunk as "silence" if:
-            # - greeting finished (silence_ready), and
-            # - user has spoken already OR grace window after greeting passed, and
-            # - frontend marks this as silence
             is_silence_chunk = (
                 not has_audio_payload
                 and session_data.silence_ready
@@ -595,23 +632,38 @@ class UltraFastSessionManagerWithSilenceHandling:
                 and (silence_detected_flag or user_status in ('user_silent', 'user_stopped_speaking'))
             )
 
-            # If the user explicitly says speaking → reset silence and mark spoken
+            # If user is speaking → reset silence trackers
             if user_status == 'user_speaking':
                 session_data.consecutive_silence_chunks = 0
                 session_data.silence_prompt_active = False
                 session_data.has_user_spoken = True
                 session_data.last_user_speech_ts = time.time()
-            # ---- PATH A: silence chunk → skip STT, count, fire only at threshold ----
+                session_data.awaiting_user = False
+                logger.info("🔊 User resumed speaking — silence state fully reset")
+
+            # ---- PATH A: silence only (no audio) ----
             if is_silence_chunk:
                 session_data.consecutive_silence_chunks += 1
                 logger.info(
                     "Session %s: silent chunk counted (%d/%d)",
-                    session_id, session_data.consecutive_silence_chunks, session_data.silence_chunks_threshold
+                    session_id,
+                    session_data.consecutive_silence_chunks,
+                    session_data.silence_chunks_threshold
                 )
 
                 if session_data.consecutive_silence_chunks >= session_data.silence_chunks_threshold:
                     session_data.consecutive_silence_chunks = 0
-                    # Build short, supportive silence response using prompts (no STT)
+
+                    # 🛑 Skip if AI is already responding
+                    if getattr(session_data, "tts_active", False) or getattr(session_data, "silence_prompt_active", False):
+                        logger.info("🔒 Skipping silence response — TTS or another silence prompt active")
+                        return
+
+                    # 🚦 Avoid infinite silence loops
+                    if getattr(session_data, "silence_response_count", 0) >= 3:
+                        logger.info("🛑 Max silence prompts reached — entering idle wait mode.")
+                        return
+
                     try:
                         ctx = {
                             "name": session_data.student_name,
@@ -627,28 +679,32 @@ class UltraFastSessionManagerWithSilenceHandling:
                                 "audio_size": len(audio_b64)
                             }
                         }
+
                         prompt = prompts.dynamic_silence_response(ctx)
                         loop = asyncio.get_event_loop()
                         text = await loop.run_in_executor(
                             shared_clients.executor,
                             self.conversation_manager._sync_openai_call,
-                            prompt,
+                            prompt
                         )
                         text = (text or "").strip()
                         if len(text.split()) < 3:
                             text = f"Take your time, {session_data.student_name}. We can continue whenever you’re ready."
 
-                        # Log and stream
                         session_data.silence_response_count = getattr(session_data, 'silence_response_count', 0) + 1
                         concept = session_data.current_concept or "silence_handling"
                         session_data.add_exchange(text, "[USER_SILENT]", 0.0, concept, False)
 
+                        # 🔊 Speak the silence line
                         session_data.silence_prompt_active = True
                         await self._send_silence_response_with_audio(session_data, text)
                         session_data.silence_prompt_active = False
 
                         soft_cutoff = getattr(session_data, "soft_cutoff_time", None)
-                        if session_data.current_stage == SessionStage.TECHNICAL and (not soft_cutoff or now_ts < soft_cutoff):
+                        if (
+                            session_data.current_stage == SessionStage.TECHNICAL
+                            and (not soft_cutoff or now_ts < soft_cutoff)
+                        ):
                             session_data.awaiting_user = True
 
                     except Exception as e_sil:
@@ -662,75 +718,143 @@ class UltraFastSessionManagerWithSilenceHandling:
                 logger.debug("Session %s: no audio data received", session_id)
                 return
 
+            # 🧠 Decode and transcribe
             audio_bytes = base64.b64decode(audio_b64)
             logger.info("Session %s: processing normal audio (%d bytes)", session_id, len(audio_bytes))
             transcript, quality = await self.audio_processor.transcribe_audio_fast(audio_bytes)
-            logger.info("🗣️ User transcript: %s  (quality=%.2f, bytes=%d)",(transcript or "").strip(), quality, len(audio_bytes))
-            # Reset silence counter and mark spoken on any real transcript
+
             if transcript and transcript.strip():
                 session_data.consecutive_silence_chunks = 0
                 session_data.has_user_spoken = True
                 session_data.last_user_speech_ts = time.time()
-            # Poor transcript handling (clarify → auto-advance)
-            if not transcript or len(transcript.strip()) < 2:
-                attempt = getattr(session_data, 'clarification_attempts', 0) + 1
-                session_data.clarification_attempts = attempt
-                if attempt >= 2:
-                    await self._auto_advance_question(session_data)
+
+            # --- ✅ SHORT-SPEECH GATE ---
+            if not transcript or len(transcript.strip().split()) < 3:
+                logger.info("🕓 User silent or too short — pausing AI progression.")
+                session_data.awaiting_user = True
+
+                # 🛑 Prevent overlap while AI still speaking
+                if getattr(session_data, "tts_active", False):
+                    logger.info("🔒 Skipping gentle silence prompt — AI still talking")
                     return
 
-                loop = asyncio.get_event_loop()
-                clarification_message = await loop.run_in_executor(
-                    shared_clients.executor,
-                    self.conversation_manager._sync_openai_call,
-                    prompts.dynamic_clarification_request({
-                        'clarification_attempts': attempt,
-                        'audio_quality': quality,
-                        'audio_size': len(audio_bytes)
-                    }),
-                )
-                await self._send_quick_message(session_data, {
-                    "type": "clarification",
-                    "text": (clarification_message or "Could you please repeat that?"),
-                    "status": session_data.current_stage.value,
-                })
-                return
+                gentle_text = f"Take your time {session_data.student_name}. We can continue when you're ready."
+                # 🔊 Speak the gentle silence prompt audibly
+                session_data.silence_prompt_active = True
+                await self._send_silence_response_with_audio(session_data, gentle_text)
+                session_data.silence_prompt_active = False
 
-            # Normal conversation flow
+                logger.info("🤖 Waiting for real speech before next question...")
+                return
+            # --- ✅ END SHORT-SPEECH GATE ---
+
+            # Reset clarification attempts since transcript is valid
             session_data.clarification_attempts = 0
 
+            # Infer domain safely
             try:
                 session_data.current_domain = self._infer_domain(transcript)
             except Exception as e:
                 logger.debug("Domain inference error: %s", e)
 
-            # Re-check time windows post-STT
-            now_ts = time.time()
-            soft_cutoff = getattr(session_data, "soft_cutoff_time", None)
-            if end_time and now_ts >= end_time:
-                concept = session_data.current_concept or "unknown"
-                is_followup = getattr(session_data, "_last_question_followup", False)
-                session_data.add_exchange("[TIME_EXPIRED]", transcript, quality, concept, is_followup)
-                if session_data.summary_manager:
-                    session_data.summary_manager.add_answer(transcript)
-                await self._end_due_to_time(session_data)
+            # --- AI RESPONSE LOGIC ---
+            if transcript and transcript.strip() and len(transcript.strip().split()) >= 2:
+                session_data.awaiting_user = False
+            else:
+                logger.info("Skipping AI response — awaiting_user remains True (no valid transcript)")
                 return
-            elif soft_cutoff and now_ts >= soft_cutoff:
-                concept = session_data.current_concept or "unknown"
-                is_followup = getattr(session_data, "_last_question_followup", False)
-                session_data.add_exchange("", transcript, quality, concept, is_followup)
-                if session_data.summary_manager:
-                    session_data.summary_manager.add_answer(transcript)
-                ai_response = await self.conversation_manager.generate_fast_response(session_data, transcript)
-                session_data.conversation_log[-1]["ai_response"] = ai_response
+
+            # ✅ Greeting phase
+            if session_data.current_stage == SessionStage.GREETING:
+                ctx = {
+                    "user_name": getattr(session_data, "student_name", ""),
+                    "domain": getattr(session_data, "current_domain", "today’s technical topic"),
+                    "time_of_day": getattr(session_data, "time_of_day", ""),
+                    "simple_english": True,
+                    "suppress_salutation": True
+                }
+                prompt = prompts.dynamic_greeting_response(
+                    user_input=transcript,
+                    greeting_count=getattr(session_data, "greeting_count", 0),
+                    context=ctx
+                )
+                loop = asyncio.get_event_loop()
+                ai_response = await loop.run_in_executor(
+                    shared_clients.executor,
+                    self.conversation_manager._sync_openai_call,
+                    prompt
+                )
+                ai_response = (ai_response or "").strip()
+                session_data.greeting_count = getattr(session_data, "greeting_count", 0) + 1
+                if session_data.greeting_count >= 1:
+                    session_data.current_stage = SessionStage.TECHNICAL
+
                 await self._send_response_with_ultra_fast_audio(session_data, ai_response)
-                await self._end_due_to_time(session_data)
+
+                # Wait until user speaks or silence timeout reached
+                session_data.awaiting_user = True
+                session_data.last_ai_ts = time.time()
+                silence_prompt_sent = False
+                idle_limit = 60
+                logger.info("🔒 Waiting for user's next input before continuing...")
+
+                while session_data.awaiting_user:
+                    await asyncio.sleep(0.3)
+                    since_speech = time.time() - getattr(session_data, "last_user_speech_ts", 0)
+
+                    if since_speech < 1.5:
+                        logger.info("🗣️ User started speaking — resuming flow")
+                        break
+
+                    if not silence_prompt_sent and since_speech > 15:
+                        gentle_line = f"Take your time {session_data.student_name}. We can continue when you're ready."
+                        session_data.silence_prompt_active = True
+                        await self._send_silence_response_with_audio(session_data, gentle_line)
+                        session_data.silence_prompt_active = False
+                        logger.info("🔊 Audible gentle silence prompt sent (15s)")
+                        silence_prompt_sent = True
+
+                    if since_speech > idle_limit:
+                        idle_line = f"No problem {session_data.student_name}, take your time. I'll wait here until you're ready."
+                        session_data.silence_prompt_active = True
+                        await self._send_silence_response_with_audio(session_data, idle_line)
+                        session_data.silence_prompt_active = False
+                        logger.info("🔊 Idle mode silence prompt played before going passive.")
+                        break
                 return
 
-            # Generate AI response
-            session_data.awaiting_user = False
-            ai_response = await self.conversation_manager.generate_fast_response(session_data, transcript)
+            # ✅ Technical questions
+            if (
+                session_data.current_stage == SessionStage.TECHNICAL
+                and getattr(session_data, "first_technical_prompt_sent", False) is False
+            ):
+                session_data.first_technical_prompt_sent = True
+                try:
+                    fm = session_data.summary_manager
+                    if fm:
+                        first_topic, first_content = fm.get_active_fragment()
+                        question_prompt = prompts.dynamic_technical_response(
+                            topic=first_topic,
+                            content=first_content,
+                            user_name=session_data.student_name,
+                            domain=getattr(session_data, "current_domain", "project")
+                        )
+                        loop = asyncio.get_event_loop()
+                        ai_response = await loop.run_in_executor(
+                            shared_clients.executor,
+                            self.conversation_manager._sync_openai_call,
+                            question_prompt
+                        )
+                        ai_response = (ai_response or "").strip()
+                    else:
+                        ai_response = "Can you tell me about your recent project update?"
+                except Exception as e_first:
+                    logger.warning(f"Failed to generate first technical question: {e_first}")
+                    ai_response = "Can you tell me about your recent project update?"
+            else:
+                ai_response = await self.conversation_manager.generate_fast_response(session_data, transcript)
 
+            # Log and send
             concept = session_data.current_concept or "unknown"
             is_followup = getattr(session_data, "_last_question_followup", False)
             session_data.add_exchange(ai_response, transcript, quality, concept, is_followup)
@@ -741,9 +865,37 @@ class UltraFastSessionManagerWithSilenceHandling:
             await self._update_session_state_fast(session_data)
             await self._send_response_with_ultra_fast_audio(session_data, ai_response)
 
-            now_ts = time.time()
-            if session_data.current_stage == SessionStage.TECHNICAL and (not soft_cutoff or now_ts < soft_cutoff):
+            # ✅ Wait after technical question (audible silence prompts)
+            if session_data.current_stage == SessionStage.TECHNICAL:
                 session_data.awaiting_user = True
+                session_data.last_ai_ts = time.time()
+                silence_prompt_sent = False
+                idle_limit = 60
+                logger.info("🔒 Waiting for user's next input before next technical question...")
+
+                while session_data.awaiting_user:
+                    await asyncio.sleep(0.3)
+                    since_speech = time.time() - getattr(session_data, "last_user_speech_ts", 0)
+
+                    if since_speech < 1.5:
+                        logger.info("🗣️ User started speaking — resuming technical discussion")
+                        break
+
+                    if not silence_prompt_sent and since_speech > 15:
+                        gentle_line = f"Take your time {session_data.student_name}. We can continue when you're ready."
+                        session_data.silence_prompt_active = True
+                        await self._send_silence_response_with_audio(session_data, gentle_line)
+                        session_data.silence_prompt_active = False
+                        logger.info("🔊 Audible gentle silence prompt sent (15s)")
+                        silence_prompt_sent = True
+
+                    if since_speech > idle_limit:
+                        idle_line = f"No problem {session_data.student_name}, take your time. I'll wait here until you're ready."
+                        session_data.silence_prompt_active = True
+                        await self._send_silence_response_with_audio(session_data, idle_line)
+                        session_data.silence_prompt_active = False
+                        logger.info("🔊 Idle mode silence prompt played before going passive.")
+                        break
 
             logger.info("Total audio processing time: %.2fs", time.time() - start_time)
 
@@ -752,16 +904,17 @@ class UltraFastSessionManagerWithSilenceHandling:
             await self._send_quick_message(session_data, {
                 "type": "error",
                 "text": "There was a problem processing your response. Please try again.",
-                "status": "error",
+                "status": "error"
             })
 
     # Handle standalone silence notifications
     async def process_silence_notification(self, session_id: str, silence_data: dict):
         """
-        Process standalone silence notification using refined gating:
+        Process standalone silence notification using refined gating (overlap-safe):
         - Ignore until greeting audio finished (silence_ready)
         - Ignore while client is still recording
         - Ignore during small cooldown right after speech
+        - Debounce and skip if a silence prompt or TTS is already active
         - Only count if user has spoken already OR we're past the post-greeting grace
         - Trigger a single supportive silence response only after N consecutive events
         """
@@ -771,59 +924,98 @@ class UltraFastSessionManagerWithSilenceHandling:
             return
 
         try:
-            # 0) Do not consider silence until greeting playback finished
-            if not getattr(session_data, "silence_ready", False):
-                return
-
             now_ts = time.time()
-
-            # 1) If the client reports it's *still recording*, don't treat this as silence
-            if silence_data.get('recordingActive'):
-                logger.debug("Session %s: silence ping ignored (recordingActive=True)", session_id)
+            # 🕒 Debounce silence prompts – avoid repeating too soon
+            last_prompt = getattr(session_data, "last_silence_prompt_ts", 0)
+            if (now_ts - last_prompt) < 8:
+                logger.info("🔁 Skipping silence — last prompt only %.2fs ago", now_ts - last_prompt)
                 return
 
-            # 2) Cooldown immediately after a speech turn (prevents instant silence after stop)
+            # 🧩 Debug all guard states early for visibility
+            logger.info(
+                f"[SilenceNotify] tts_active={getattr(session_data, 'tts_active', None)}, "
+                f"silence_prompt_active={getattr(session_data, 'silence_prompt_active', None)}, "
+                f"has_user_spoken={getattr(session_data, 'has_user_spoken', None)}, "
+                f"time_since_last_speech={now_ts - getattr(session_data, 'last_user_speech_ts', 0):.2f}s"
+            )
+
+           # 🚫 Prevent if AI TTS is still streaming or just finished
+            if getattr(session_data, "tts_active", False) or \
+            (now_ts - getattr(session_data, "last_tts_end_ts", 0)) < 1.2:
+                logger.info("🔒 Skipping silence notification — TTS still finishing playback")
+                return
+
+            # 🧱 Prevent double triggers while another silence prompt is running
+            if getattr(session_data, "silence_prompt_active", False):
+                logger.info("🔒 Silence prompt already active — skipping duplicate trigger")
+                return
+
+            # 🕓 Skip if recent user speech within 5s
+            last_speech_ts = getattr(session_data, "last_user_speech_ts", 0)
+            if (now_ts - last_speech_ts) < 5:
+                logger.info("🕒 Skipping silence notification — recent speech %.2fs ago", now_ts - last_speech_ts)
+                return
+
+            # 0️⃣ Ignore silence until greeting playback finished
+            if not getattr(session_data, "silence_ready", False):
+                logger.debug("Session %s: silence ignored — greeting not finished", session_id)
+                return
+
+            # 1️⃣ Ignore if still recording
+            if silence_data.get('recordingActive'):
+                # Check if actual voice energy is detected (frontend should include a flag)
+                if silence_data.get('userSpeaking', False):
+                    logger.debug("Session %s: skipping silence — user is actively speaking", session_id)
+                    return
+                else:
+                    logger.debug("Session %s: mic recording but user silent — continuing silence handling", session_id)
+
+            # 2️⃣ Short cooldown after user speech
             cooldown_s = getattr(config, "SILENCE_COOLDOWN_AFTER_SPEECH_SECONDS", 2.0)
-            last_speech_ts = getattr(session_data, "last_user_speech_ts", None)
-            if last_speech_ts is not None and (now_ts - last_speech_ts) < cooldown_s:
+            if last_speech_ts and (now_ts - last_speech_ts) < cooldown_s:
                 logger.debug(
                     "Session %s: silence ping ignored (within %.2fs speech cooldown)",
                     session_id, cooldown_s
                 )
                 return
 
-            # 3) Respect a small grace window after greeting before counting initial quiet
+            # 3️⃣ Grace window after greeting
             past_greeting_grace = (
-                getattr(session_data, "greeting_end_ts", None) is not None and
-                (now_ts - session_data.greeting_end_ts) >= getattr(
-                    session_data, "silence_grace_after_greeting_s", 4
-                )
+                getattr(session_data, "greeting_end_ts", None) is not None
+                and (now_ts - session_data.greeting_end_ts)
+                >= getattr(session_data, "silence_grace_after_greeting_s", 4)
             )
 
-            # Only count if user has already spoken (true in-between) OR we're past grace
+            # Only count if user has spoken or grace period passed
             if not (getattr(session_data, "has_user_spoken", False) or past_greeting_grace):
                 logger.debug(
-                    "Session %s: silence ping ignored (no prior speech and still in grace window)",
+                    "Session %s: silence ignored (no prior speech and still in grace window)",
                     session_id
                 )
                 return
 
-            # 4) Count consecutive silence events and trigger only at threshold
+            # 4️⃣ Count consecutive silence chunks (lowered threshold)
             session_data.consecutive_silence_chunks = getattr(session_data, "consecutive_silence_chunks", 0) + 1
-            threshold = getattr(session_data, "silence_chunks_threshold", getattr(config, "SILENCE_CHUNKS_THRESHOLD", 1))
+            threshold = 1  # ✅ Immediate trigger on first silence
             logger.info(
                 "Session %s: silence notification counted (%d/%d)",
                 session_id, session_data.consecutive_silence_chunks, threshold
             )
 
+            # Not yet at threshold — wait for next ping
             if session_data.consecutive_silence_chunks < threshold:
                 return
 
-            # Reached threshold ⇒ reset counter and produce a supportive silence response
+            # Reached threshold ⇒ reset counter and handle silence
             session_data.consecutive_silence_chunks = 0
 
+            # 🚦 Stop after multiple silences (3+) — gentle end guard
+            if getattr(session_data, 'silence_response_count', 0) >= 3:
+                logger.info("🛑 Max silence prompts reached — entering idle wait mode.")
+                return
+
             try:
-                # Build minimal context for a short supportive response
+                # Build detailed silence context
                 ctx = {
                     "name": session_data.student_name,
                     "silence_count": getattr(session_data, 'silence_response_count', 0) + 1,
@@ -840,26 +1032,32 @@ class UltraFastSessionManagerWithSilenceHandling:
                     }
                 }
 
-                # Generate a concise, supportive message (your existing helper)
-                # NOTE: If you prefer to avoid LLM here, replace this call with a local template.
+                # 🧠 Generate one gentle silence line (LLM or fallback)
                 text = await self.generate_dynamic_silence_response(session_data, ctx)
                 if not text or len(text.split()) < 3:
                     text = f"Take your time, {session_data.student_name}. We can continue whenever you’re ready."
 
-                # Log the exchange and stream TTS
+                # Record it
                 session_data.silence_response_count = getattr(session_data, 'silence_response_count', 0) + 1
                 concept = getattr(session_data, "current_concept", None) or "silence_handling"
                 session_data.add_exchange(text, "[USER_SILENT]", 0.0, concept, False)
 
-                session_data.silence_prompt_active = True
+               
+                # 🔊 Send silence prompt audibly (lock handled inside)
+                await asyncio.sleep(0.2)   # small buffer to let prior TTS flush
                 await self._send_silence_response_with_audio(session_data, text)
-                session_data.silence_prompt_active = False
+                session_data.last_silence_prompt_ts = time.time()
 
-                # After a silence response, keep listening if we're still in TECHNICAL stage
+                # ⏳ Reset and wait for user
                 soft_cutoff = getattr(session_data, "soft_cutoff_time", None)
-                if (session_data.current_stage == SessionStage.TECHNICAL and
-                    (soft_cutoff is None or now_ts < soft_cutoff)):
+                if (
+                    session_data.current_stage == SessionStage.TECHNICAL
+                    and (soft_cutoff is None or now_ts < soft_cutoff)
+                ):
                     session_data.awaiting_user = True
+
+                # 🕓 Update last AI time (avoid immediate re-triggers)
+                session_data.last_ai_ts = time.time()
 
                 logger.info("Session %s: standalone silence prompt delivered", session_id)
 
@@ -869,52 +1067,96 @@ class UltraFastSessionManagerWithSilenceHandling:
         except Exception as e:
             logger.error("Silence notification processing error: %s", e)
 
+
     # Send silence response with specific message type
     async def _send_silence_response_with_audio(self, session_data: SessionData, text: str):
-        """Send silence response with TTS audio; cancel mid-stream if speech resumes."""
+        """
+        Send silence response with proper TTS playback (frontend audible).
+        Fixes missing audio playback by keeping tts_active=True and restarting TTS pipeline if needed.
+        """
+        # 🧠 Wait if previous TTS just finished
+        now = time.time()
+        if (now - getattr(session_data, "last_tts_end_ts", 0)) < 1.2:
+            logger.info("⏸️ Waiting for previous TTS playback to finish (%.2fs since end)", now - session_data.last_tts_end_ts)
+            await asyncio.sleep(1.2 - (now - session_data.last_tts_end_ts))
+
         try:
+            # 🧩 Skip if another silence prompt is active
+            if getattr(session_data, "silence_prompt_active", False):
+                logger.info("🔒 Silence response already active — skipping duplicate playback.")
+                return
+
+            # 🟢 Lock to prevent overlapping silence responses
+            session_data.silence_prompt_active = True
+            session_data.tts_active = True   # ✅ FIX 1: mark AI as speaking (frontend robot active)
+
+            # 📢 Notify frontend of silence response text (text-only part)
             await self._send_quick_message(session_data, {
-                "type": "silence_response",
+                "type": "ai_response",
                 "text": text,
                 "status": session_data.current_stage.value,
             })
 
+            logger.info("🎧 Starting silence TTS stream for session %s", session_data.session_id)
             chunk_count = 0
+
+            # 🧠 FIX 2: restart TTS session if internal TTS inactive (not session_data.is_active)
+            try:
+                if not self.tts_processor.is_session_active(session_data.session_id):
+                    self.tts_processor.start_session(session_data.session_id)
+                    logger.debug("🔄 Restarted TTS processor for silence stream: %s", session_data.session_id)
+            except Exception as restart_err:
+                logger.warning("⚠️ Could not restart TTS for silence response: %s", restart_err)
+
+            # 🔊 Stream silence response audio
             async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
                 text, session_id=session_data.session_id
             ):
-                if not session_data.is_active or not session_data.silence_prompt_active:
+                if not session_data.is_active:
+                    logger.info("🛑 Session inactive — stopping silence TTS.")
                     break
-                await self._send_quick_message(session_data, {
-                    "type": "audio_chunk",
-                    "audio": audio_chunk.hex(),
-                    "status": session_data.current_stage.value,
-                })
-                chunk_count += 1
 
+                if audio_chunk:
+                    try:
+                        # 🎵 send chunk for audible playback
+                        await self._send_quick_message(session_data, {
+                            "type": "audio_chunk",
+                            "audio": audio_chunk.hex(),
+                            "status": session_data.current_stage.value,
+                        })
+                        if chunk_count == 0:
+                            logger.info("🎵 Silence TTS audible stream confirmed start")
+                        chunk_count += 1
+                    except Exception as send_err:
+                        logger.warning("⚠️ Silence chunk send failed: %s", send_err)
+                        continue
+
+            # 🔚 Always mark audio_end (robot emoji off)
             await self._send_quick_message(session_data, {
                 "type": "audio_end",
-                "status": session_data.current_stage.value
+                "status": session_data.current_stage.value,
             })
 
-            logger.info("Streamed %d silence response audio chunks", chunk_count)
+            logger.info("✅ Streamed %d silence response audio chunks (session %s)",
+                        chunk_count, session_data.session_id)
 
         except Exception as e:
             logger.error("Silence response audio streaming error: %s", e)
 
-    # Legacy method - redirect to new audio processing
-    async def process_audio_ultra_fast(self, session_id: str, audio_data: bytes):
-        """Legacy method - convert to new format and use enhanced processing"""
-        # Convert old format to new message format
-        import base64
-        audio_b64 = base64.b64encode(audio_data).decode('utf-8')
-        message_data = {
-            'audio': audio_b64,
-            'userStatus': 'user_speaking',  # Default status
-            'silenceDetected': False,
-            'recordingDuration': 0
-        }
-        await self.process_audio_with_silence_status(session_id, message_data)
+        finally:
+            # 🧹 FIX 3: Reset locks only after full stream ends
+            session_data.silence_prompt_active = False
+            # Mark TTS as finished but keep a soft cooldown to avoid overlap
+            session_data.tts_active = False
+            session_data.last_tts_end_ts = time.time()
+
+            # 🕓 Add small post-playback buffer so next TTS waits a bit
+            await asyncio.sleep(1.2)
+            await asyncio.sleep(0.05)
+            logger.debug("🧹 Silence TTS state reset for session %s", session_data.session_id)
+            session_data.last_silence_prompt_ts = time.time()
+
+
 
     async def _update_session_state_fast(self, session_data: SessionData):
         try:
@@ -986,27 +1228,94 @@ class UltraFastSessionManagerWithSilenceHandling:
             await self.remove_session(session_data.session_id)
 
     async def _send_response_with_ultra_fast_audio(self, session_data: SessionData, text: str):
+        """
+        Stream AI text response as ultra-fast audio safely.
+        - Prevents overlapping with other TTS or silence prompts
+        - Sets tts_active flag for coordination with silence detection
+        - Does NOT abort early due to misread user_speech flag (fixes silent playback)
+        - Ensures TTS session restarts if not active
+        """
+        # 🧠 Wait if previous TTS just finished
+        now = time.time()
+        if (now - getattr(session_data, "last_tts_end_ts", 0)) < 1.2:
+            logger.info("⏸️ Waiting for previous TTS playback to finish (%.2fs since end)", now - session_data.last_tts_end_ts)
+            await asyncio.sleep(1.2 - (now - session_data.last_tts_end_ts))
+
         try:
+            # 🔒 Skip if another TTS is truly active
+            if getattr(session_data, "tts_active", False):
+                logger.info("🔒 Skipping new TTS — another stream already running.")
+                return
+
+            # 🟢 Reset silence prompt lock (always clear before new TTS)
+            session_data.silence_prompt_active = False
+            session_data.tts_active = True
+
+            # 🧠 Restart TTS session if needed (fix for stale / idle pipelines)
+            if not session_data.is_active:
+                try:
+                    self.tts_processor.start_session(session_data.session_id)
+                    logger.debug("🔄 Restarted TTS processor session: %s", session_data.session_id)
+                except Exception as restart_err:
+                    logger.warning("⚠️ Could not restart TTS session: %s", restart_err)
+
+            # 📢 Send AI text response first (frontend displays immediately)
+            logger.debug("📤 Sent AI text response to frontend for session %s", session_data.session_id)
             await self._send_quick_message(session_data, {
                 "type": "ai_response",
                 "text": text,
                 "status": session_data.current_stage.value,
             })
+
+            logger.info("🎧 Starting ultra-fast TTS stream for session %s", session_data.session_id)
             chunk_count = 0
+
+            # 🎙️ Stream the TTS audio chunks continuously
             async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
                 text, session_id=session_data.session_id
             ):
-                if audio_chunk and session_data.is_active:
-                    await self._send_quick_message(session_data, {
-                        "type": "audio_chunk",
-                        "audio": audio_chunk.hex(),
-                        "status": session_data.current_stage.value,
-                    })
-                    chunk_count += 1
-            await self._send_quick_message(session_data, {"type": "audio_end", "status": session_data.current_stage.value})
-            logger.info("Streamed %d audio chunks", chunk_count)
+                # 🧩 Exit only if session is inactive (not on user_spoke flag)
+                if not session_data.is_active:
+                    logger.info("🛑 Session inactive — stopping TTS stream.")
+                    break
+
+                # 🧩 Send chunk if valid
+                if audio_chunk:
+                    try:
+                        await self._send_quick_message(session_data, {
+                            "type": "audio_chunk",
+                            "audio": audio_chunk.hex(),
+                            "status": session_data.current_stage.value,
+                        })
+                        chunk_count += 1
+                    except Exception as send_err:
+                        logger.warning("⚠️ Audio chunk send failed: %s", send_err)
+                        continue
+
+            # 🔚 Always mark end of audio stream
+            await self._send_quick_message(session_data, {
+                "type": "audio_end",
+                "status": session_data.current_stage.value,
+            })
+
+            logger.info("✅ Streamed %d audio chunks successfully (session %s)",
+                        chunk_count, session_data.session_id)
+
         except Exception as e:
             logger.error("Ultra-fast audio streaming error: %s", e)
+
+        finally:
+            
+            # Mark TTS as finished but keep a soft cooldown to avoid overlap
+            session_data.tts_active = False
+            session_data.last_tts_end_ts = time.time()
+
+            # 🕓 Add small post-playback buffer so next TTS waits a bit
+            await asyncio.sleep(1.2)
+            session_data.awaiting_user = True
+            session_data.silence_prompt_active = False
+            logger.debug("🧹 TTS state reset (tts_active=False, silence_prompt_active=False)")
+
 
     async def _send_quick_message(self, session_data: SessionData, message: dict):
         try:
@@ -1349,6 +1658,7 @@ async def health_check_fast():
 # =============================================================================
 # ENHANCED WEBSOCKET WITH SILENCE HANDLING
 # =============================================================================
+
 @app.websocket("/ws/{session_id}")
 async def enhanced_websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
@@ -1392,6 +1702,9 @@ async def enhanced_websocket_endpoint(websocket: WebSocket, session_id: str):
             # ---- NEW: enable silence handling only AFTER greeting audio finishes ----
             session_data.silence_ready = True
             session_data.greeting_end_ts = time.time()
+            # ⏳ Post-greeting grace window: ignore silence for first few seconds
+            session_data.suppress_silence_until = time.time() + 4.0
+            logger.info("🕓 Greeting finished — silence detection will activate after 4 s grace")
 
         except Exception as tts_error:
             logger.error("TTS error during greeting: %s", tts_error)

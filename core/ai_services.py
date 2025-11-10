@@ -364,6 +364,9 @@ class DS_OptimizedConversationManager:
             raise Exception(f"OpenAI API failed: {e}")
 
     async def generate_fast_response(self, session_data: DS_SessionData, user_input: str) -> str:
+        if getattr(session_data, "awaiting_user", False):
+            logger.info("⏸️ Still awaiting user input — skipping AI response generation")
+            return ""
         try:
             if session_data.current_stage == DS_SessionStage.GREETING:
                 ctx = {
