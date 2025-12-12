@@ -60,6 +60,9 @@ class UnifiedTTSProcessor:
 
         # session_id -> chosen audio_prompt_path
         self._session_voice_map: Dict[str, Optional[str]] = {}
+        
+        # Track active streams for interruption
+        self._active_streams: Dict[str, bool] = {}
 
         # Pre-scan reference audio pool
         self._ref_pool = self._scan_ref_audios(self.ref_audio_dir)
@@ -72,10 +75,25 @@ class UnifiedTTSProcessor:
         if session_id in self._session_voice_map:
             return
         self._session_voice_map[session_id] = self._choose_ref_audio()
+        self._active_streams[session_id] = True
+
+    def stop_stream(self, session_id: str, stream_type: str = None):
+        """Stop an active TTS stream for a session."""
+        self._active_streams[session_id] = False
+        logger.info(f"[TTS] Stream stop requested for session {session_id} (type={stream_type})")
+
+    def is_session_active(self, session_id: str) -> bool:
+        """Check if a session exists and is active."""
+        return session_id in self._session_voice_map
+
+    def should_continue_stream(self, session_id: str) -> bool:
+        """Check if streaming should continue (used in generate loop)."""
+        return self._active_streams.get(session_id, True)
 
     def end_session(self, session_id: str):
         """Forget the pinned voice for a session."""
         self._session_voice_map.pop(session_id, None)
+        self._active_streams.pop(session_id, None)
 
     def _scan_ref_audios(self, ref_dir: Path):
         patterns = ["*.wav", "*.mp3", "*.flac", "*.ogg", "*.m4a"]
@@ -109,12 +127,12 @@ class UnifiedTTSProcessor:
             if session_id not in self._session_voice_map:
                 self.start_session(session_id)
             audio_prompt_path = self._session_voice_map.get(session_id)
+            # Reset stop flag at start of new stream
+            self._active_streams[session_id] = True
 
         try:
             # --- Preferred path: streaming available (sync generator) ---
             if hasattr(self.model, "generate_stream") and callable(getattr(self.model, "generate_stream")):
-                # NOTE: generate_stream in example_vc_stream.py is a *sync* generator
-                # so we iterate it directly (this may block briefly while yielding).
                 for audio_chunk, _metrics in self.model.generate_stream(
                     text=text,
                     audio_prompt_path=audio_prompt_path,
@@ -124,13 +142,17 @@ class UnifiedTTSProcessor:
                     exaggeration=self.exaggeration,
                     print_metrics=False,
                 ):
+                    # Check stop flag each iteration
+                    if session_id and not self._active_streams.get(session_id, True):
+                        logger.info(f"[TTS] Stream stopped mid-generation for {session_id}")
+                        return
+                    
                     yield self._encode_chunk(audio_chunk, self.model.sr)
                 return
 
             # --- Fallback path: no streaming in this build; use one-shot generate ---
             if hasattr(self.model, "generate") and callable(getattr(self.model, "generate")):
                 wav = self.model.generate(text=text, audio_prompt_path=audio_prompt_path)
-                # yield once so the frontend still gets "some" audio
                 yield self._encode_chunk(wav, self.model.sr)
                 return
 
@@ -140,7 +162,6 @@ class UnifiedTTSProcessor:
         except Exception as e:
             logger.error("[TTS] Streaming/generation error: %s", e)
             return
-
 
     # ---------------- Health check ----------------
     async def health_check(self) -> dict:
@@ -152,7 +173,7 @@ class UnifiedTTSProcessor:
                 exaggeration=0.7,
                 temperature=0.8, cfg_weight=0.1, print_metrics=False
             )
-            async for audio_chunk, _m in gen:
+            for audio_chunk, _m in gen:  # Sync generator - use regular for loop
                 _ = audio_chunk
                 chunks += 1
                 if chunks >= 1:
